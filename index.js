@@ -1,526 +1,561 @@
 require('dotenv').config();
-const { ethers } = require('ethers');
-const readline = require('readline-sync'); // For manual input
+const Web3 = require('web3');
+const axios = require('axios');
+const chalk = require('chalk'); // Untuk log berwarna
+const figlet = require('figlet'); // Untuk banner ASCII
 
-// --- Basic Logger (for demonstration) ---
-const logger = {
-    info: (...args) => console.log(`[INFO] ${new Date().toLocaleString()}:`, ...args),
-    warn: (...args) => console.warn(`[WARN] ${new Date().toLocaleString()}:`, ...args),
-    error: (...args) => console.error(`[ERROR] ${new Date().toLocaleString()}:`, ...args),
-    debug: (...args) => console.log(`[DEBUG] ${new Date().toLocaleString()}:`, ...args),
-};
+// --- Konfigurasi Umum ---
+const RPC_URL = "https://testnet.dplabs-internal.com";
+const PHRS_ADDRESS = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"; // Alamat token native
+const WPHRS_ADDRESS = "0x3019b247381c850ab53dc0ee53bce7a07ea9155f"; // Alamat Wrapped PHRS
+const USDT_ADDRESS = "0xd4071393f8716661958f766df660033b3d35fd29"; // Alamat token USDT test
+const ROUTER_ADDRESS = "0x3541423f25a1ca5c98fdbcf478405d3f0aad1164"; // Alamat FaroSwap Router
+const LP_ADDRESS = "0x4b177aded3b8bd1d5d747f91b9e853513838cd49"; // Alamat FaroSwap LP Pool (DVM)
+const FAUCET_USDT_URL = "https://testnet-router.zenithswap.xyz/api/v1/faucet"; // URL Faucet USDT
 
-// --- Configuration ---
-const PRIVATE_KEY = process.env.PRIVATE_KEY;
+// --- Variabel Repetisi ---
+const SWAP_REPETITIONS = 10;
+const SEND_PHRS_REPETITIONS = 10;
+const ADD_LIQUIDITY_REPETITIONS = 10;
 
-if (!PRIVATE_KEY) {
-    logger.error("Error: PRIVATE_KEY not found in .env file. Please add it.");
+// --- Private Keys dari .env ---
+const ALL_PRIVATE_KEYS_STRING = process.env.PRIVATE_KEYS;
+if (!ALL_PRIVATE_KEYS_STRING) {
+    console.error(chalk.bgRed.white(`❌ ERROR: PRIVATE_KEYS tidak ditemukan di file .env. Harap atur.`));
     process.exit(1);
 }
+const privateKeys = ALL_PRIVATE_KEYS_STRING.split(',').map(key => key.trim());
 
-const PHAROS_TESTNET_RPC_URL = 'https://testnet.dplabs-internal.com';
-const CHAIN_ID = 688688; // Pharos Testnet Chain ID
+// --- Alamat Penerima PHRS (opsional) dari .env ---
+const RECIPIENT_PHRS_ADDRESS = process.env.RECIPIENT_PHRS_ADDRESS || "0x0000000000000000000000000000000000000000";
 
-// Contract Addresses
-const USDT_TOKEN_ADDRESS = '0xed59de2d7ad9c043442e381231ee3646fc3c2939';
-const USDC_TOKEN_ADDRESS = '0xad902cf99c2de2f1ba5ec4d642fd7e49cae9ee37';
-const WPHRS_TOKEN_ADDRESS = '0x76aaada469d23216be5f7c596fa25f282ff9b364'; // Wrapped Native Token (WETH equivalent)
-const UNIVERSAL_ROUTER_ADDRESS = '0x1d416077dc5a9721d4f7a57f2cbccb0e65d8373e'; // Position Manager / Universal Router
-
-// Token Decimals
-const tokenDecimals = {
-    WPHRS: 18,
-    USDC: 6,
-    USDT: 6,
-};
-
-// Token Address Mapping (using your symbols)
-const tokenAddressMap = {
-    WPHRS: WPHRS_TOKEN_ADDRESS,
-    USDC: USDC_TOKEN_ADDRESS,
-    USDT: USDT_TOKEN_ADDRESS,
-    PHRS: WPHRS_TOKEN_ADDRESS // Treat PHRS as WPHRS for mapping, but handle native for value transfer
-};
-
-// --- Your Provided Options ---
-const pairOptions = [
-    { id: 1, from: 'WPHRS', to: 'USDC', amount: 0.0001 },
-    { id: 2, from: 'WPHRS', to: 'USDT', amount: 0.0001 },
-    { id: 3, from: 'USDC', to: 'WPHRS', amount: 0.0001 },
-    { id: 4, from: 'USDT', to: 'WPHRS', amount: 0.0001 },
-    { id: 5, from: 'USDC', to: 'USDT', amount: 0.0001 },
-    { id: 6, from: 'USDT', to: 'USDC', amount: 0.0001 },
-];
-
-const lpOptions = [
-    { id: 1, token0: 'WPHRS', token1: 'USDC', amount0: 0.0001, amount1: 0.0001, fee: 3000 },
-    { id: 2, token0: 'WPHRS', token1: 'USDT', amount0: 0.0001, amount1: 0.0001, fee: 3000 },
-];
-
-// --- ABIs ---
-// Combined Universal Router ABI for multicall and specific swap functions (if supported)
-const UNIVERSAL_ROUTER_ABI = [
-    {
-        inputs: [
-            { internalType: 'uint256', name: 'collectionAndSelfcalls', type: 'uint256' },
-            { internalType: 'bytes[]', name: 'data', type: 'bytes[]' },
-        ],
-        name: 'multicall',
-        outputs: [],
-        stateMutability: 'payable', // Multicall can be payable for native token operations
-        type: 'function',
-    },
-    // Adding `exactInputSingle` and `exactInput` for V3 if directly callable (not just via multicall)
-    // You'd need to confirm if these are directly exposed or only callable via multicall
-    "function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96)) payable returns (uint256 amountOut)",
-    "function exactInput((bytes path, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum)) payable returns (uint256 amountOut)",
-    // Also include V2-like swaps if those are still present on the router:
-    "function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) returns (uint256[] amounts)",
-    "function swapExactETHForTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline) payable returns (uint256[] amounts)",
-    "function swapExactTokensForETH(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) returns (uint256[] amounts)",
-
-    // Add Universal Router specific commands if available and needed (e.g. from their source code or ABI)
-    // These are placeholders/examples based on common Universal Router command IDs
-    "function wrapETH(address recipient, uint256 amountOutMinimum) payable",
-    "function unwrapWETH(address recipient, uint256 amountOutMinimum) payable",
-];
-
+// --- ABI Definitions ---
 const ERC20_ABI = [
-    'function balanceOf(address) view returns (uint256)',
-    'function allowance(address owner, address spender) view returns (uint256)',
-    'function approve(address spender, uint256 amount) public returns (bool)',
-    'function decimals() view returns (uint8)',
-    'function symbol() view returns (string)',
-    'function deposit() public payable', // WETH deposit (for wrapping native token)
-    'function withdraw(uint256 wad) public', // WETH withdraw (for unwrapping native token)
+    "function balanceOf(address owner) view returns (uint256)",
+    "function approve(address spender, uint256 amount) returns (bool)",
+    "function allowance(address owner, address spender) view returns (uint256)",
+    "function decimals() view returns (uint8)"
 ];
 
-const POSITION_MANAGER_ABI = [
-    {
-        inputs: [
-            {
-                components: [
-                    { internalType: 'address', name: 'token0', type: 'address' },
-                    { internalType: 'address', name: 'token1', type: 'address' },
-                    { internalType: 'uint24', name: 'fee', type: 'uint24' },
-                    { internalType: 'int24', name: 'tickLower', type: 'int24' },
-                    { internalType: 'int24', name: 'tickUpper', type: 'int24' },
-                    { internalType: 'uint256', name: 'amount0Desired', type: 'uint256' },
-                    { internalType: 'uint256', name: 'amount1Desired', type: 'uint256' },
-                    { internalType: 'uint256', name: 'amount0Min', type: 'uint256' },
-                    { internalType: 'uint256', name: 'amount1Min', type: 'uint256' },
-                    { internalType: 'address', name: 'recipient', type: 'address' },
-                    { internalType: 'uint256', name: 'deadline', type: 'uint256' },
-                ],
-                internalType: 'struct INonfungiblePositionManager.MintParams',
-                name: 'params',
-                type: 'tuple',
-            },
-        ],
-        name: 'mint',
-        outputs: [
-            { internalType: 'uint256', name: 'tokenId', type: 'uint256' },
-            { internalType: 'uint128', name: 'liquidity', type: 'uint128' },
-            { internalType: 'uint256', name: 'amount0', type: 'uint256' },
-            { internalType: 'uint256', name: 'amount1', type: 'uint256' },
-        ],
-        stateMutability: 'payable',
-        type: 'function',
-    },
-    "function positions(uint256 tokenId) external view returns (uint96 nonce, address operator, address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)"
+const WPHRS_ABI = [
+    "function deposit() payable",
+    "function withdraw(uint256 wad)",
+    "function balanceOf(address owner) view returns (uint256)",
+    "function approve(address spender, uint256 amount) returns (bool)",
+    "function allowance(address owner, address spender) view returns (uint256)",
+    "function decimals() view returns (uint8)"
 ];
 
-// --- Setup Provider and Wallet ---
-const provider = new ethers.JsonRpcProvider(PHAROS_TESTNET_RPC_URL, {
-    chainId: CHAIN_ID,
-    name: 'Pharos Testnet'
-});
-const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+const ROUTER_ABI = [
+    "function mixSwap(address fromToken, address toToken, uint256 fromAmount, uint256 resAmount, uint256 minReturnAmount, address[] memory proxyList, address[] memory poolList, address[] memory routeList, uint256 direction, bytes[] memory moreInfos, uint256 deadLine) external payable returns (uint256)"
+];
 
-logger.info(`Connected with wallet address: ${wallet.address}`);
+const LP_ABI = [
+    "function addDVMLiquidity(address dvmAddress, uint256 baseInAmount, uint256 quoteInAmount, uint256 baseMinAmount, uint256 quoteMinAmount, uint8 flag, uint256 deadLine) external payable returns (uint256, uint256, uint256)"
+];
 
-// --- Core Utility Functions ---
+// --- Inisialisasi Web3 ---
+const web3 = new Web3(RPC_URL);
 
-// Function to wait for transaction receipt with retry logic
-const waitForTransactionWithRetry = async (provider, txHash, maxRetries = 10, baseDelayMs = 2000) => {
-    let retries = 0;
-    while (retries < maxRetries) {
+// Daftar untuk menyimpan objek akun Web3 setelah diinisialisasi
+const accounts = [];
+
+/**
+ * Menginisialisasi semua akun dari private key yang diberikan.
+ * Menambahkan mereka ke Web3 wallet untuk penandatanganan otomatis.
+ */
+async function initializeAccounts() {
+    console.log(chalk.blue(`\n${chalk.bold('🚀 Inisialisasi Akun...')}`));
+    for (const pk of privateKeys) {
         try {
-            const receipt = await provider.getTransactionReceipt(txHash);
-            if (receipt && receipt.blockNumber) {
-                logger.info(`Transaction ${txHash} confirmed in block ${receipt.blockNumber}. Status: ${receipt.status === 1 ? 'Success' : 'Failed'}`);
-                if (receipt.status === 0) {
-                    throw new Error(`Transaction ${txHash} failed on-chain.`);
-                }
-                return receipt;
-            }
-            logger.warn(`Transaction receipt not found for ${txHash}, retrying (${retries + 1}/${maxRetries})...`);
-            await new Promise(resolve => setTimeout(resolve, baseDelayMs * Math.pow(2, retries)));
-            retries++;
+            const account = web3.eth.accounts.privateKeyToAccount(pk);
+            accounts.push({
+                privateKey: pk,
+                address: account.address,
+                wallet: web3.eth.accounts.wallet.add(account) // Menambahkan ke Web3 wallet
+            });
+            console.log(chalk.green(`  ✅ Akun diinisialisasi: ${account.address}`));
         } catch (error) {
-            if (error.code === 'TRANSACTION_REPLACED' || error.code === 'TIMEOUT' || error.code === -32008) {
-                logger.warn(`RPC error for ${txHash} (${error.code}), retrying (${retries + 1}/${maxRetries})...`);
-                await new Promise(resolve => setTimeout(resolve, baseDelayMs * Math.pow(2, retries)));
-                retries++;
-            } else {
-                logger.error(`Unhandled error fetching transaction receipt for ${txHash}: ${error.message}`);
-                throw error;
-            }
+            console.error(chalk.red(`  ❌ Gagal menginisialisasi private key: ${pk.substring(0, 10)}... Error: ${error.message}`));
         }
     }
-    throw new Error(`Failed to get transaction receipt for ${txHash} after ${maxRetries} retries`);
-};
-
-// Function to get manual delay from user
-const getManualDelay = (prompt, defaultValue) => {
-    let delay = parseInt(readline.question(prompt + ` (default: ${defaultValue}s): `));
-    if (isNaN(delay) || delay < 0) {
-        logger.warn(`Invalid input. Using default delay of ${defaultValue} seconds.`);
-        return defaultValue * 1000; // Return in milliseconds
-    }
-    return delay * 1000; // Convert to milliseconds
-};
-
-// Helper to get token contract
-async function getTokenContract(tokenSymbol) {
-    const address = tokenAddressMap[tokenSymbol];
-    if (!address) {
-        throw new Error(`Unknown token symbol: ${tokenSymbol}`);
-    }
-    return new ethers.Contract(address, ERC20_ABI, wallet);
-}
-
-// Approve token function (now also using waitForTransactionWithRetry)
-async function approveToken(tokenSymbol, spenderAddress, amountToApprove) {
-    try {
-        const tokenContract = await getTokenContract(tokenSymbol);
-        const ownerAddress = await wallet.getAddress();
-        const currentAllowance = await tokenContract.allowance(ownerAddress, spenderAddress);
-        const tokenDec = tokenDecimals[tokenSymbol];
-
-        if (currentAllowance >= amountToApprove) {
-            logger.info(`Allowance for ${tokenSymbol} already sufficient (${ethers.formatUnits(currentAllowance, tokenDec)}).`);
-            return true;
-        }
-
-        logger.info(`Approving ${ethers.formatUnits(amountToApprove, tokenDec)} ${tokenSymbol} for ${spenderAddress}...`);
-        const tx = await tokenContract.approve(spenderAddress, amountToApprove);
-        logger.info(`Approval transaction sent: ${tx.hash}`);
-        await waitForTransactionWithRetry(provider, tx.hash);
-        logger.info(`Approval for ${tokenSymbol} successful!`);
-        return true;
-    } catch (error) {
-        logger.error(`Error approving ${tokenSymbol}: ${error.message}`);
-        return false;
+    if (accounts.length === 0) {
+        console.error(chalk.bgRed.white(`❌ ERROR: Tidak ada akun yang berhasil diinisialisasi. Pastikan private key valid.`));
+        process.exit(1);
     }
 }
 
-// Function to check token balance and approval
-const checkBalanceAndApproval = async (wallet, tokenSymbol, amount, spenderAddress) => {
+// --- Helper Functions ---
+
+/**
+ * Mengambil desimal token ERC-20. Default 18 jika tidak dapat diambil atau untuk PHRS native.
+ * @param {string} tokenAddress - Alamat kontrak token.
+ * @returns {Promise<number>} Jumlah desimal.
+ */
+async function getTokenDecimals(tokenAddress) {
+    if (tokenAddress === PHRS_ADDRESS) {
+        return 18;
+    }
+    const tokenContract = new web3.eth.Contract(ERC20_ABI, tokenAddress);
     try {
-        // Native token (PHRS) balance check (assuming WPHRS represents PHRS for user input)
-        if (tokenSymbol === 'WPHRS') {
-            const nativeBalance = await provider.getBalance(wallet.address);
-            const requiredNative = ethers.parseEther(amount.toString());
-            if (nativeBalance < requiredNative) {
-                logger.warn(`Skipping: Insufficient PHRS balance. Have: ${ethers.formatEther(nativeBalance)}, Need: ${amount}`);
-                return false;
-            }
-            // No approval needed for native token when sent as value
-            return true;
-        }
-
-        // ERC-20 token balance and approval check
-        const tokenContract = await getTokenContract(tokenSymbol);
-        const balance = await tokenContract.balanceOf(wallet.address);
-        const decimals = tokenDecimals[tokenSymbol];
-        const required = ethers.parseUnits(amount.toString(), decimals);
-
-        if (balance < required) {
-            logger.warn(`Skipping: Insufficient ${tokenSymbol} balance. Have: ${ethers.formatUnits(balance, decimals)}, Need: ${amount}`);
-            return false;
-        }
-
-        // Check allowance for ERC-20 tokens only
-        const allowance = await tokenContract.allowance(wallet.address, spenderAddress); // New constant allowance
-        if (allowance < required) {
-            logger.warn(`Allowance for ${tokenSymbol} is insufficient. Current: ${ethers.formatUnits(allowance, decimals)}, Required: ${amount}`);
-            const approved = await approveToken(tokenSymbol, spenderAddress, ethers.MaxUint256); // Approve max
-            if (!approved) {
-                logger.error(`Failed to get sufficient approval for ${tokenSymbol}.`);
-                return false;
-            }
-        }
-        return true; // Balance is sufficient and approval is set (or not needed)
+        const decimals = await tokenContract.methods.decimals().call();
+        return parseInt(decimals);
     } catch (error) {
-        logger.error(`Error in checkBalanceAndApproval for ${tokenSymbol}: ${error.message}`);
-        return false;
+        console.warn(chalk.yellow(`⚠️ Peringatan: Tidak dapat mengambil desimal untuk ${tokenAddress}. Mengasumsikan 18. Error: ${error.message}`));
+        return 18;
     }
-};
+}
 
-// --- Universal Router Multicall Data Encoding (Based on Uniswap Universal Router) ---
-// COMMAND IDs (These are Uniswap Universal Router specific, Faroswap might differ!)
-const Commands = {
-    V3_SWAP_EXACT_IN: '0x00', // Example command ID
-    WRAP_NATIVE_TOKEN: '0x05', // Example command ID
-    UNWRAP_WETH: '0x06', // Example command ID
-    // Add other command IDs as needed from Faroswap's Universal Router
-};
+/**
+ * Menyetujui token untuk alamat spender.
+ * @param {object} accountInfo - Objek akun saat ini (berisi privateKey dan address).
+ * @param {string} tokenAddress - Alamat token yang akan disetujui.
+ * @param {string} spenderAddress - Alamat spender (misalnya, router, pool LP).
+ * @param {BN} amount - Jumlah dalam Wei yang akan disetujui.
+ * @returns {Promise<object|null>} Resi transaksi atau null jika sudah disetujui.
+ */
+async function approveToken(accountInfo, tokenAddress, spenderAddress, amount) {
+    const { address, privateKey } = accountInfo;
 
-// Interface for encoding function calls
-const routerInterface = new ethers.Interface(UNIVERSAL_ROUTER_ABI);
-
-const getMulticallData = (pair, amount, walletAddress, slippage = 0.005) => {
-    const commands = [];
-    const inputs = [];
-    let value = BigInt(0); // Value to send with multicall (for native token)
-
-    const fromTokenAddress = tokenAddressMap[pair.from];
-    const toTokenAddress = tokenAddressMap[pair.to];
-    const parsedAmountIn = ethers.parseUnits(amount.toString(), tokenDecimals[pair.from]);
-
-    // --- IMPORTANT: Calculate amountOutMin dynamically using a price oracle or router.getAmountsOut ---
-    // For now, using a placeholder for amountOutMin. This is highly risky in production.
-    const amountOutMin = BigInt(0); // Placeholder, REPLACE THIS!
-
-    // Handle wrapping native token (PHRS) to WPHRS if `from` is PHRS/WPHRS
-    if (pair.from === 'WPHRS') {
-        // If the swap path starts with native token, we must first wrap it.
-        // Assuming Universal Router has a WRAP_NATIVE_TOKEN command
-        commands.push(Commands.WRAP_NATIVE_TOKEN);
-        inputs.push(routerInterface.encodeFunctionData("wrapETH", [walletAddress, 0])); // recipient, amountOutMinimum
-        value = parsedAmountIn; // Send PHRS as value
+    if (tokenAddress === PHRS_ADDRESS) {
+        return null; // Token native tidak perlu persetujuan
     }
 
-    // Main swap command
-    commands.push(Commands.V3_SWAP_EXACT_IN); // Assuming V3 swap for now
-    inputs.push(
-        routerInterface.encodeFunctionData("exactInputSingle", [ // Using exactInputSingle as an example
-            {
-                tokenIn: fromTokenAddress,
-                tokenOut: toTokenAddress,
-                fee: 3000, // IMPORTANT: Get the correct fee tier for the pool! (e.g., 3000 for 0.3%)
-                recipient: walletAddress,
-                deadline: Math.floor(Date.now() / 1000) + 60 * 20,
-                amountIn: parsedAmountIn,
-                amountOutMinimum: amountOutMin,
-                sqrtPriceLimitX96: 0 // Optional: Set to 0 for no limit
-            }
-        ])
-    );
+    const tokenContract = new web3.eth.Contract(ERC20_ABI, tokenAddress);
+    const currentAllowance = await tokenContract.methods.allowance(address, spenderAddress).call();
 
-    // Handle unwrapping WPHRS to native token (PHRS) if `to` is PHRS/WPHRS
-    if (pair.to === 'WPHRS') {
-        commands.push(Commands.UNWRAP_WETH);
-        inputs.push(routerInterface.encodeFunctionData("unwrapWETH", [walletAddress, amountOutMin])); // recipient, amountOutMinimum
-    }
+    if (web3.utils.toBN(currentAllowance).lt(amount)) {
+        console.log(chalk.cyan(`    ⏳ Menyetujui ${web3.utils.fromWei(amount.toString(), 'ether')} token untuk ${spenderAddress}...`));
+        try {
+            const tx = tokenContract.methods.approve(spenderAddress, amount);
+            const gas = await tx.estimateGas({ from: address });
+            const gasPrice = await web3.eth.getGasPrice();
+            const data = tx.encodeABI();
 
-    // Encode the final multicall transaction
-    const multicallData = routerInterface.encodeFunctionData("multicall", [
-        // The first argument `collectionAndSelfcalls` is specific to the Universal Router.
-        // It's a bitmask indicating which commands to collect/selfcall.
-        // For simple sequential calls without complex logic, often 0 is sufficient,
-        // but verify Faroswap's exact implementation.
-        0, // Placeholder: This might need to be adjusted based on Faroswap's router logic
-        inputs
-    ]);
+            const transaction = {
+                from: address,
+                to: tokenAddress,
+                data: data,
+                gas: gas,
+                gasPrice: gasPrice
+            };
 
-    return { multicallData, value };
-};
-
-// --- Swaps and Liquidity Functions ---
-
-async function addLiquidityV3(token0Symbol, token1Symbol, amount0, amount1, feeTier, slippage = 0.005) {
-    try {
-        const positionManager = new ethers.Contract(UNIVERSAL_ROUTER_ADDRESS, POSITION_MANAGER_ABI, wallet);
-        const token0Address = tokenAddressMap[token0Symbol];
-        const token1Address = tokenAddressMap[token1Symbol];
-
-        const parsedAmount0 = ethers.parseUnits(amount0.toString(), tokenDecimals[token0Symbol]);
-        const parsedAmount1 = ethers.parseUnits(amount1.toString(), tokenDecimals[token1Symbol]);
-
-        // Check balances and approvals before proceeding
-        const canProceed0 = await checkBalanceAndApproval(wallet, token0Symbol, amount0, UNIVERSAL_ROUTER_ADDRESS);
-        const canProceed1 = await checkBalanceAndApproval(wallet, token1Symbol, amount1, UNIVERSAL_ROUTER_ADDRESS);
-
-        if (!canProceed0 || !canProceed1) {
-            logger.warn(`Skipping Add Liquidity for ${token0Symbol}/${token1Symbol} due to insufficient balance or approval.`);
-            return;
+            const signedTx = await web3.eth.accounts.signTransaction(transaction, privateKey);
+            const receipt = await web3.eth.sendSignedTransaction(signedTx.rawTransaction);
+            console.log(chalk.green(`    ✅ Persetujuan berhasil: ${receipt.transactionHash}`));
+            return receipt;
+        } catch (error) {
+            console.error(chalk.red(`    ❌ Gagal menyetujui token: ${error.message}`));
+            return null;
         }
+    } else {
+        console.log(chalk.gray(`    ℹ️ Token sudah disetujui atau persetujuan cukup.`));
+        return null;
+    }
+}
 
-        // Sort tokens for Uniswap V3
-        const { token0: sortedToken0Address, token1: sortedToken1Address } = getSortedTokens(token0Address, token1Address);
+/**
+ * Mendapatkan saldo token (PHRS atau ERC-20) untuk alamat tertentu.
+ * @param {string} tokenAddress - Alamat token.
+ * @param {string} address - Alamat wallet yang akan diperiksa.
+ * @returns {Promise<number>} Saldo sebagai float.
+ */
+async function getBalance(tokenAddress, address) {
+    if (tokenAddress === PHRS_ADDRESS) {
+        const balanceWei = await web3.eth.getBalance(address);
+        return parseFloat(web3.utils.fromWei(balanceWei, 'ether'));
+    } else {
+        const tokenContract = new web3.eth.Contract(ERC20_ABI, tokenAddress);
+        const balanceWei = await tokenContract.methods.balanceOf(address).call();
+        const decimals = await getTokenDecimals(tokenAddress);
+        return parseFloat(balanceWei) / (10 ** decimals);
+    }
+}
 
-        // --- IMPORTANT: Tick Calculation (Using full range for simplicity on testnet) ---
-        const tickLower = -887272; // Uniswap V3 MIN_TICK
-        const tickUpper = 887272; // Uniswap V3 MAX_TICK
+/**
+ * Meminta USDT test dari faucet.
+ * @param {string} address - Alamat yang akan menerima USDT.
+ * @returns {Promise<object>} Data respons faucet.
+ */
+async function requestFaucetUSDT(address) {
+    console.log(chalk.blue(`  ⏳ Meminta USDT dari faucet untuk ${address}...`));
+    try {
+        const response = await axios.post(FAUCET_USDT_URL, { address: address });
+        if (response.data.code === 200) {
+            console.log(chalk.green(`  ✅ Permintaan faucet berhasil: ${response.data.msg}`));
+        } else {
+            console.error(chalk.red(`  ❌ Permintaan faucet gagal: ${response.data.msg}`));
+        }
+        return response.data;
+    } catch (error) {
+        console.error(chalk.red(`  ❌ Error saat meminta faucet: ${error.message}`));
+        if (error.response && error.response.data && error.response.data.msg) {
+             console.error(chalk.red(`  Detail Error Faucet: ${error.response.data.msg}`));
+        }
+        return null;
+    }
+}
 
-        // Calculate min amounts with slippage
-        const amount0Min = parsedAmount0 - (parsedAmount0 * BigInt(Math.round(slippage * 10000))) / BigInt(10000);
-        const amount1Min = parsedAmount1 - (parsedAmount1 * BigInt(Math.round(slippage * 10000))) / BigInt(10000);
+/**
+ * Mengonversi PHRS native menjadi WPHRS.
+ * @param {object} accountInfo - Objek akun saat ini.
+ * @param {number} amountFloat - Jumlah PHRS yang akan dibungkus.
+ * @returns {Promise<object>} Resi transaksi.
+ */
+async function wrapPHRS(accountInfo, amountFloat) {
+    const { address, privateKey } = accountInfo;
+    console.log(chalk.blue(`  ⏳ Membungkus ${amountFloat} PHRS menjadi WPHRS untuk ${address}...`));
+    try {
+        const amountWei = web3.utils.toWei(amountFloat.toString(), 'ether');
+        const wphrsContract = new web3.eth.Contract(WPHRS_ABI, WPHRS_ADDRESS);
 
-        const deadline = Math.floor(Date.now() / 1000) + 60 * 20; // 20 minutes from now
+        const tx = wphrsContract.methods.deposit();
+        const gas = await tx.estimateGas({ from: address, value: amountWei });
+        const gasPrice = await web3.eth.getGasPrice();
+        const data = tx.encodeABI();
 
-        logger.info(`\nAdding liquidity for ${token0Symbol}/${token1Symbol} (Fee: ${feeTier / 10000}%)...`);
-        logger.info(`Desired ${token0Symbol}: ${amount0}, Desired ${token1Symbol}: ${amount1}`);
-        logger.info(`Tick Range: [${tickLower}, ${tickUpper}]`);
-
-        const params = {
-            token0: sortedToken0Address,
-            token1: sortedToken1Address,
-            fee: feeTier,
-            tickLower: tickLower,
-            tickUpper: tickUpper,
-            amount0Desired: parsedAmount0,
-            amount1Desired: parsedAmount1,
-            amount0Min: amount0Min,
-            amount1Min: amount1Min,
-            recipient: wallet.address,
-            deadline: deadline,
+        const transaction = {
+            from: address,
+            to: WPHRS_ADDRESS,
+            data: data,
+            gas: gas,
+            gasPrice: gasPrice,
+            value: amountWei
         };
 
-        let ethValue = BigInt(0);
-        // If WPHRS is involved, send its equivalent native token amount as msg.value
-        if (token0Symbol === 'WPHRS' || token1Symbol === 'WPHRS') {
-            if (token0Symbol === 'WPHRS') {
-                ethValue = parsedAmount0;
-            } else {
-                ethValue = parsedAmount1;
-            }
-            logger.info(`Sending ${ethers.formatEther(ethValue)} PHRS as value with transaction.`);
-        }
-
-        const tx = await positionManager.mint(params, {
-            value: ethValue,
-            gasLimit: 1500000
-        });
-        logger.info(`Add Liquidity (V3) transaction sent: ${tx.hash}`);
-        const receipt = await waitForTransactionWithRetry(provider, tx.hash);
-
-        const mintEvent = receipt.logs.find(log => {
-            try {
-                return positionManager.interface.parseLog(log)?.name === 'Mint';
-            } catch (e) {
-                return false;
-            }
-        });
-        if (mintEvent) {
-             logger.info(`Minted Token ID: ${mintEvent.args.tokenId}`);
-             logger.info(`Liquidity: ${mintEvent.args.liquidity}`);
-        } else {
-            logger.warn("Could not find Mint event in transaction receipt.");
-        }
-        logger.info(`Add Liquidity (V3) successful! Transaction Hash: ${tx.hash}`);
+        const signedTx = await web3.eth.accounts.signTransaction(transaction, privateKey);
+        const receipt = await web3.eth.sendSignedTransaction(signedTx.rawTransaction);
+        console.log(chalk.green(`  ✅ Bungkus PHRS berhasil: ${receipt.transactionHash}`));
+        return receipt;
 
     } catch (error) {
-        logger.error("Error adding liquidity (V3):", error);
-        throw error;
+        console.error(chalk.red(`  ❌ Gagal membungkus PHRS untuk ${address}: ${error.message}`));
+        if (error.receipt) {
+            console.error(chalk.red(`  Resi Transaksi: ${JSON.stringify(error.receipt, null, 2)}`));
+        }
+        return null;
     }
 }
 
-async function performSwap(pair, delayMs) { // `pair` object directly passed
+/**
+ * Mengirim PHRS native ke alamat penerima.
+ * @param {object} accountInfo - Objek akun saat ini.
+ * @param {string} recipientAddress - Alamat penerima PHRS.
+ * @param {number} amountFloat - Jumlah PHRS yang akan dikirim.
+ * @returns {Promise<object>} Resi transaksi.
+ */
+async function sendPHRS(accountInfo, recipientAddress, amountFloat) {
+    const { address, privateKey } = accountInfo;
+    console.log(chalk.blue(`  ⏳ Mengirim ${amountFloat} PHRS dari ${address} ke ${recipientAddress}...`));
     try {
-        const router = new ethers.Contract(UNIVERSAL_ROUTER_ADDRESS, UNIVERSAL_ROUTER_ABI, wallet);
+        const amountWei = web3.utils.toWei(amountFloat.toString(), 'ether');
 
-        // Check balance and approval for the `from` token
-        const canProceed = await checkBalanceAndApproval(wallet, pair.from, pair.amount, UNIVERSAL_ROUTER_ADDRESS);
-        if (!canProceed) {
-            logger.warn(`Skipping Swap ID ${pair.id} from ${pair.from} to ${pair.to} due to insufficient balance or approval.`);
-            return;
-        }
+        const gas = await web3.eth.estimateGas({ from: address, to: recipientAddress, value: amountWei });
+        const gasPrice = await web3.eth.getGasPrice();
 
-        logger.info(`\nSwapping ${pair.amount} ${pair.from} for ${pair.to} (ID: ${pair.id})...`);
+        const transaction = {
+            from: address,
+            to: recipientAddress,
+            value: amountWei,
+            gas: gas,
+            gasPrice: gasPrice
+        };
 
-        // Get multicall data
-        const { multicallData, value } = getMulticallData(pair, pair.amount, wallet.address);
-
-        const tx = await router.multicall(0, [multicallData], { // Adjust `collectionAndSelfcalls` if needed
-            value: value, // Send native token as value if wrapping
-            gasLimit: 1000000 // Adjust gas limit for multicall swap
-        });
-        logger.info(`Swap transaction sent: ${tx.hash}`);
-        await waitForTransactionWithRetry(provider, tx.hash);
-        logger.info(`Swap ID ${pair.id} successful! Transaction Hash: ${tx.hash}`);
-
-        // Introduce delay between transactions
-        if (delayMs > 0) {
-            logger.info(`Waiting for ${delayMs / 1000} seconds before next transaction...`);
-            await new Promise(resolve => setTimeout(resolve, delayMs));
-        }
+        const signedTx = await web3.eth.accounts.signTransaction(transaction, privateKey);
+        const receipt = await web3.eth.sendSignedTransaction(signedTx.rawTransaction);
+        console.log(chalk.green(`  ✅ Kirim PHRS berhasil: ${receipt.transactionHash}`));
+        return receipt;
 
     } catch (error) {
-        logger.error(`Error performing swap ID ${pair.id}: ${error.message}`);
-        throw error;
+        console.error(chalk.red(`  ❌ Gagal mengirim PHRS dari ${address}: ${error.message}`));
+        if (error.receipt) {
+            console.error(chalk.red(`  Resi Transaksi: ${JSON.stringify(error.receipt, null, 2)}`));
+        }
+        return null;
     }
 }
 
-async function main() {
+/**
+ * Melakukan operasi mixSwap di FaroSwap.
+ * @param {object} accountInfo - Objek akun saat ini.
+ * @param {string} fromTokenAddress - Alamat token asal swap.
+ * @param {string} toTokenAddress - Alamat token tujuan swap.
+ * @param {number} fromAmountFloat - Jumlah token asal yang akan di-swap.
+ * @param {number} minReturnAmountFloat - Jumlah minimum token tujuan yang diharapkan.
+ * @returns {Promise<object>} Resi transaksi.
+ */
+async function performMixSwap(accountInfo, fromTokenAddress, toTokenAddress, fromAmountFloat, minReturnAmountFloat) {
+    const { address, privateKey } = accountInfo;
+    console.log(chalk.blue(`  ⏳ Memulai mixSwap: ${fromAmountFloat} dari ${fromTokenAddress} ke ${toTokenAddress} untuk ${address}...`));
+
     try {
-        logger.info("\n--- Starting Automated Operations on Faroswap (V3-like) ---");
+        const fromTokenDecimals = await getTokenDecimals(fromTokenAddress);
+        const toTokenDecimals = await getTokenDecimals(toTokenAddress);
 
-        const delayBetweenTx = getManualDelay('Enter delay BETWEEN each transaction in seconds', 20);
-        const verificationDelay = getManualDelay('Enter delay for API VERIFICATION in seconds', 10);
+        const fromAmountWei = web3.utils.toBN(fromAmountFloat * (10 ** fromTokenDecimals));
+        const minReturnAmountWei = web3.utils.toBN(minReturnAmountFloat * (10 ** toTokenDecimals));
 
-        // --- Manual Mode Selector ---
-        const operationChoice = readline.question(
-            "\nChoose operation:\n" +
-            "1. Run all Swaps\n" +
-            "2. Run all Add Liquidity\n" +
-            "3. Run all Swaps AND all Add Liquidity\n" +
-            "Enter choice (1/2/3): "
+        await approveToken(accountInfo, fromTokenAddress, ROUTER_ADDRESS, fromAmountWei);
+
+        // --- SANGAT PENTING: Parameter ini perlu dikonfirmasi dari dokumentasi/sumber FaroSwap ---
+        // Nilai placeholder - Anda HARUS mendapatkan nilai yang benar untuk ini!
+        const resAmount = web3.utils.toBN(0);
+        const proxyList = [];
+        const poolList = [];
+        const routeList = [];
+        const direction = 0; // Konfirmasi 0 atau 1 untuk arah swap yang diinginkan
+        const moreInfos = [];
+
+        const deadLine = Math.floor(Date.now() / 1000) + (60 * 20); // 20 menit dari sekarang
+
+        const swapTx = faroSwapRouter.methods.mixSwap(
+            fromTokenAddress,
+            toTokenAddress,
+            fromAmountWei,
+            resAmount,
+            minReturnAmountWei,
+            proxyList,
+            poolList,
+            routeList,
+            direction,
+            moreInfos,
+            deadLine
         );
 
-        let runSwaps = false;
-        let runAddLiquidity = false;
+        const gas = await swapTx.estimateGas({ from: address, value: fromTokenAddress === PHRS_ADDRESS ? fromAmountWei : 0 });
+        const gasPrice = await web3.eth.getGasPrice();
+        const data = swapTx.encodeABI();
 
-        if (operationChoice === '1') {
-            runSwaps = true;
-        } else if (operationChoice === '2') {
-            runAddLiquidity = true;
-        } else if (operationChoice === '3') {
-            runSwaps = true;
-            runAddLiquidity = true;
+        const transaction = {
+            from: address,
+            to: ROUTER_ADDRESS,
+            data: data,
+            gas: gas,
+            gasPrice: gasPrice,
+            value: fromTokenAddress === PHRS_ADDRESS ? fromAmountWei : 0
+        };
+
+        const signedTx = await web3.eth.accounts.signTransaction(transaction, privateKey);
+        const receipt = await web3.eth.sendSignedTransaction(signedTx.rawTransaction);
+        console.log(chalk.green(`  ✅ mixSwap berhasil: ${receipt.transactionHash}`));
+
+        if (receipt.events && receipt.events.MixSwap) { // Ganti 'MixSwap' dengan nama event sebenarnya dari FaroSwap
+            console.log(chalk.cyan(`    Detail Event Swap (dari resi): ${JSON.stringify(receipt.events.MixSwap.returnValues)}`));
         } else {
-            logger.error("Invalid choice. Exiting.");
-            return;
+            console.log(chalk.yellow(`    ⚠️ Tidak ada event swap spesifik yang ditemukan di resi. Periksa block explorer.`));
         }
-
-        // --- Execute Swaps from pairOptions (if chosen) ---
-        if (runSwaps) {
-            logger.info("\n*** Executing Swaps ***");
-            for (const pair of pairOptions) {
-                logger.info(`\n--- Attempting Swap ID: ${pair.id} (${pair.from} to ${pair.to}) ---`);
-                try {
-                    await performSwap(pair, delayBetweenTx);
-                } catch (error) {
-                    logger.error(`Failed to execute swap ID ${pair.id}. Moving to next operation.`);
-                }
-                await new Promise(resolve => setTimeout(resolve, verificationDelay)); // Delay after each operation for API verification
-            }
-        }
-
-        // --- Execute Add Liquidity from lpOptions (if chosen) ---
-        if (runAddLiquidity) {
-            logger.info("\n*** Executing Add Liquidity ***");
-            for (const lp of lpOptions) {
-                logger.info(`\n--- Attempting LP ID: ${lp.id} (${lp.token0}/${lp.token1}) ---`);
-                try {
-                    await addLiquidityV3(lp.token0, lp.token1, lp.amount0, lp.amount1, lp.fee);
-                } catch (error) {
-                    logger.error(`Failed to add liquidity ID ${lp.id}. Moving to next operation.`);
-                }
-                await new Promise(resolve => setTimeout(resolve, verificationDelay)); // Delay after each operation for API verification
-            }
-        }
-
-        logger.info("\n--- Automated Operations Completed ---");
+        return receipt;
 
     } catch (error) {
-        logger.error("Fatal error in main execution:", error);
-    } finally {
-        // Ensure readline-sync doesn't keep process open if not needed
-        // readline.close(); // readline-sync doesn't have a close method
+        console.error(chalk.red(`  ❌ Gagal mixSwap untuk ${address}: ${error.message}`));
+        if (error.receipt) {
+            console.error(chalk.red(`  Resi Transaksi: ${JSON.stringify(error.receipt, null, 2)}`));
+        }
+        return null;
     }
 }
 
-main().catch(error => logger.error("Unhandled error in main execution:", error));
+/**
+ * Menambah likuiditas ke DVM pool di FaroSwap.
+ * @param {object} accountInfo - Objek akun saat ini.
+ * @param {string} dvmAddress - Alamat DVM pool.
+ * @param {string} baseTokenAddress - Alamat token dasar.
+ * @param {string} quoteTokenAddress - Alamat token quote.
+ * @param {number} baseInAmountFloat - Jumlah token dasar yang akan ditambahkan.
+ * @param {number} quoteInAmountFloat - Jumlah token quote yang akan ditambahkan.
+ * @param {number} baseMinAmountFloat - Jumlah minimum token dasar yang akan ditambahkan.
+ * @param {number} quoteMinAmountFloat - Jumlah minimum token quote yang akan ditambahkan.
+ * @returns {Promise<object>} Resi transaksi.
+ */
+async function addDVMLiquidity(accountInfo, dvmAddress, baseTokenAddress, quoteTokenAddress, baseInAmountFloat, quoteInAmountFloat, baseMinAmountFloat, quoteMinAmountFloat) {
+    const { address, privateKey } = accountInfo;
+    console.log(chalk.blue(`  ⏳ Menambah likuiditas ke DVM Pool ${dvmAddress} untuk ${address}...`));
+
+    try {
+        const baseTokenDecimals = await getTokenDecimals(baseTokenAddress);
+        const quoteTokenDecimals = await getTokenDecimals(quoteTokenAddress);
+
+        const baseInAmountWei = web3.utils.toBN(baseInAmountFloat * (10 ** baseTokenDecimals));
+        const quoteInAmountWei = web3.utils.toBN(quoteInAmountFloat * (10 ** quoteTokenDecimals));
+        const baseMinAmountWei = web3.utils.toBN(baseMinAmountFloat * (10 ** baseTokenDecimals));
+        const quoteMinAmountWei = web3.utils.toBN(quoteInAmountFloat * (10 ** quoteTokenDecimals));
+
+        await approveToken(accountInfo, baseTokenAddress, dvmAddress, baseInAmountWei);
+        await approveToken(accountInfo, quoteTokenAddress, dvmAddress, quoteInAmountWei);
+
+        const flag = 0; // Konfirmasi arti 'flag' dari dokumentasi FaroSwap
+        const deadLine = Math.floor(Date.now() / 1000) + (60 * 20);
+
+        const addLiquidityTx = faroSwapLP.methods.addDVMLiquidity(
+            dvmAddress,
+            baseInAmountWei,
+            quoteInAmountWei,
+            baseMinAmountWei,
+            quoteMinAmountWei,
+            flag,
+            deadLine
+        );
+
+        const gas = await addLiquidityTx.estimateGas({ from: address, value: baseTokenAddress === PHRS_ADDRESS ? baseInAmountWei : 0 });
+        const gasPrice = await web3.eth.getGasPrice();
+        const data = addLiquidityTx.encodeABI();
+
+        const transaction = {
+            from: address,
+            to: dvmAddress,
+            data: data,
+            gas: gas,
+            gasPrice: gasPrice,
+            value: baseTokenAddress === PHRS_ADDRESS ? baseInAmountWei : 0
+        };
+
+        const signedTx = await web3.eth.accounts.signTransaction(transaction, privateKey);
+        const receipt = await web3.eth.sendSignedTransaction(signedTx.rawTransaction);
+        console.log(chalk.green(`  ✅ Tambah likuiditas berhasil: ${receipt.transactionHash}`));
+        return receipt;
+
+    } catch (error) {
+        console.error(chalk.red(`  ❌ Gagal menambah likuiditas untuk ${address}: ${error.message}`));
+        if (error.receipt) {
+            console.error(chalk.red(`  Resi Transaksi: ${JSON.stringify(error.receipt, null, 2)}`));
+        }
+        return null;
+    }
+}
+
+// --- Logika Eksekusi Utama ---
+
+/**
+ * Fungsi utama untuk menjalankan semua transaksi otomatis.
+ */
+async function main() {
+    // Tampilkan banner ASCII
+    console.log(chalk.cyan(figlet.textSync('FAROSWAP BOT', { horizontalLayout: 'full' })));
+
+    console.log(chalk.blue(`\n======================================================`));
+    console.log(chalk.blue(`  Skrip Otomatisasi Testnet FaroSwap`));
+    console.log(chalk.blue(`======================================================`));
+    console.log(chalk.blue(`  Terhubung ke RPC: ${RPC_URL}`));
+    console.log(chalk.blue(`======================================================\n`));
+
+    await initializeAccounts();
+
+    if (accounts.length === 0) {
+        console.error(chalk.bgRed.white(`❌ ERROR: Tidak ada akun yang dapat diproses. Script berhenti.`));
+        return;
+    }
+
+    // Loop melalui setiap akun
+    for (const account of accounts) {
+        console.log(chalk.magenta(`\n\n${chalk.bold('████████████████████████████████████████████████████')}`));
+        console.log(chalk.magenta(`████ Memproses Akun: ${chalk.yellow(account.address)} ████`));
+        console.log(chalk.magenta(`████████████████████████████████████████████████████\n`));
+
+        // --- Cek Saldo Awal untuk Akun Saat Ini ---
+        console.log(chalk.blue(`--- Saldo Awal Akun ${account.address} ---`));
+        const phrsBalance = await getBalance(PHRS_ADDRESS, account.address);
+        const usdtBalance = await getBalance(USDT_ADDRESS, account.address);
+        const wphrsBalance = await getBalance(WPHRS_ADDRESS, account.address);
+        console.log(chalk.cyan(`  PHRS: ${phrsBalance.toFixed(6)} PHRS`));
+        console.log(chalk.cyan(`  USDT: ${usdtBalance.toFixed(6)} USDT`));
+        console.log(chalk.cyan(`  WPHRS: ${wphrsBalance.toFixed(6)} WPHRS`));
+        console.log(chalk.blue(`-----------------------------------------\n`));
+
+        // --- Opsional: Minta USDT dari Faucet ---
+        // Aktifkan jika Anda sering membutuhkan USDT test
+        // console.log(chalk.blue(`--- Meminta USDT dari Faucet ---`));
+        // await requestFaucetUSDT(account.address);
+        // await new Promise(resolve => setTimeout(resolve, 5000)); // Beri waktu faucet untuk memproses
+        // console.log(chalk.cyan(`  Saldo USDT terbaru: ${await getBalance(USDT_ADDRESS, account.address).toFixed(6)} USDT\n`));
+
+        // --- Opsional: Tambah WPHRS awal dengan membungkus PHRS ---
+        // Aktifkan jika Anda membutuhkan WPHRS untuk memulai. Pastikan Anda punya PHRS native!
+        // const phrsToWrap = 0.005; // Jumlah PHRS native yang akan dibungkus
+        // if (phrsBalance >= phrsToWrap) {
+        //     console.log(chalk.blue(`--- Membungkus ${phrsToWrap} PHRS ke WPHRS ---`));
+        //     await wrapPHRS(account, phrsToWrap);
+        //     await new Promise(resolve => setTimeout(resolve, 5000)); // Beri waktu transaksi
+        //     console.log(chalk.cyan(`  Saldo WPHRS terbaru: ${await getBalance(WPHRS_ADDRESS, account.address).toFixed(6)} WPHRS`));
+        //     console.log(chalk.cyan(`  Saldo PHRS terbaru: ${await getBalance(PHRS_ADDRESS, account.address).toFixed(6)} PHRS\n`));
+        // } else {
+        //     console.warn(chalk.yellow(`  ⚠️ PHRS native tidak cukup untuk dibungkus. Anda punya ${phrsBalance} PHRS, butuh ${phrsToWrap}. Melewatkan pembungkusan.\n`));
+        // }
+
+        // --- Lakukan Swap ---
+        console.log(chalk.blue(`\n--- Memulai ${SWAP_REPETITIONS} Repetisi Swap untuk ${account.address} ---`));
+        for (let i = 0; i < SWAP_REPETITIONS; i++) {
+            console.log(chalk.yellow(`\n--- SWAP Repetisi ${i + 1}/${SWAP_REPETITIONS} (USDT -> WPHRS) ---`));
+            const usdtToSwap = 0.001; // Jumlah USDT untuk swap per repetisi
+            const minWphrsReturn = 0.0000001; // WPHRS minimum yang diharapkan (sesuaikan dengan harga & slippage)
+
+            const currentUsdtBalance = await getBalance(USDT_ADDRESS, account.address);
+            if (currentUsdtBalance >= usdtToSwap) {
+                await performMixSwap(account, USDT_ADDRESS, WPHRS_ADDRESS, usdtToSwap, minWphrsReturn);
+            } else {
+                console.warn(chalk.red(`  ❌ Saldo USDT tidak cukup untuk swap. Anda punya ${currentUsdtBalance}, butuh ${usdtToSwap}. Melewatkan swap ini.`));
+            }
+            await new Promise(resolve => setTimeout(resolve, 7000)); // Jeda antar swap
+        }
+        console.log(chalk.blue(`\n--- Selesai ${SWAP_REPETITIONS} Repetisi Swap ---`));
+
+        // --- Lakukan Kirim PHRS ---
+        console.log(chalk.blue(`\n--- Memulai ${SEND_PHRS_REPETITIONS} Repetisi Kirim PHRS untuk ${account.address} ---`));
+        const phrsToSend = 0.00001; // Jumlah PHRS yang akan dikirim per repetisi
+
+        if (RECIPIENT_PHRS_ADDRESS === "0x0000000000000000000000000000000000000000") {
+            console.warn(chalk.red(`\n  ❌ PERINGATAN: Harap ganti '0x0000000000000000000000000000000000000000' di .env dengan alamat penerima PHRS yang valid. Melewatkan pengiriman PHRS.\n`));
+        } else {
+            for (let i = 0; i < SEND_PHRS_REPETITIONS; i++) {
+                console.log(chalk.yellow(`\n--- KIRIM PHRS Repetisi ${i + 1}/${SEND_PHRS_REPETITIONS} ---`));
+                const currentPhrsBalance = await getBalance(PHRS_ADDRESS, account.address);
+                if (currentPhrsBalance >= phrsToSend + 0.000005) { // Tambah sedikit untuk gas
+                    await sendPHRS(account, RECIPIENT_PHRS_ADDRESS, phrsToSend);
+                } else {
+                    console.warn(chalk.red(`  ❌ Saldo PHRS tidak cukup untuk mengirim. Anda punya ${currentPhrsBalance}, butuh sekitar ${phrsToSend}. Melewatkan pengiriman ini.`));
+                }
+                await new Promise(resolve => setTimeout(resolve, 7000)); // Jeda
+            }
+        }
+        console.log(chalk.blue(`\n--- Selesai ${SEND_PHRS_REPETITIONS} Repetisi Kirim PHRS ---`));
+
+        // --- Lakukan Tambah Likuiditas ---
+        console.log(chalk.blue(`\n--- Memulai ${ADD_LIQUIDITY_REPETITIONS} Repetisi Tambah Likuiditas untuk ${account.address} ---`));
+        const baseLiquidityAmount = 0.0001; // Jumlah WPHRS yang akan ditambahkan
+        const quoteLiquidityAmount = 0.01; // Jumlah USDT yang akan ditambahkan
+        const minBaseReturn = 0.00005;
+        const minQuoteReturn = 0.005;
+
+        for (let i = 0; i < ADD_LIQUIDITY_REPETITIONS; i++) {
+            console.log(chalk.yellow(`\n--- TAMBAH LIKUIDITAS Repetisi ${i + 1}/${ADD_LIQUIDITY_REPETITIONS} ---`));
+            const currentWphrsBalance = await getBalance(WPHRS_ADDRESS, account.address);
+            const currentUsdtBalance = await getBalance(USDT_ADDRESS, account.address);
+
+            if (currentWphrsBalance >= baseLiquidityAmount && currentUsdtBalance >= quoteLiquidityAmount) {
+                await addDVMLiquidity(account, LP_ADDRESS, WPHRS_ADDRESS, USDT_ADDRESS, baseLiquidityAmount, quoteLiquidityAmount, minBaseReturn, minQuoteReturn);
+            } else {
+                console.warn(chalk.red(`  ❌ Saldo token tidak cukup untuk menambah likuiditas. WPHRS: ${currentWphrsBalance}/${baseLiquidityAmount}, USDT: ${currentUsdtBalance}/${quoteLiquidityAmount}. Melewatkan penambahan likuiditas ini.`));
+            }
+            await new Promise(resolve => setTimeout(resolve, 10000)); // Jeda lebih lama untuk transaksi LP
+        }
+        console.log(chalk.blue(`\n--- Selesai ${ADD_LIQUIDITY_REPETITIONS} Repetisi Tambah Likuiditas ---`));
+
+        // --- Cek Saldo Akhir untuk Akun Saat Ini ---
+        console.log(chalk.magenta(`\n\n████ Saldo Akhir Akun: ${chalk.yellow(account.address)} ████`));
+        const finalPhrsBalance = await getBalance(PHRS_ADDRESS, account.address);
+        const finalUsdtBalance = await getBalance(USDT_ADDRESS, account.address);
+        const finalWphrsBalance = await getBalance(WPHRS_ADDRESS, account.address);
+        console.log(chalk.cyan(`  PHRS: ${finalPhrsBalance.toFixed(6)} PHRS`));
+        console.log(chalk.cyan(`  USDT: ${finalUsdtBalance.toFixed(6)} USDT`));
+        console.log(chalk.cyan(`  WPHRS: ${finalWphrsBalance.toFixed(6)} WPHRS`));
+        console.log(chalk.magenta(`████████████████████████████████████████████████████\n`));
+
+        await new Promise(resolve => setTimeout(resolve, 15000)); // Jeda sebelum ke akun berikutnya
+    }
+
+    console.log(chalk.green(`\n======================================================`));
+    console.log(chalk.green(`  ✅ Semua Akun Telah Selesai Diproses!`);
+    console.log(chalk.green(`======================================================\n`));
+}
+
+// Mulai eksekusi script
+main();
